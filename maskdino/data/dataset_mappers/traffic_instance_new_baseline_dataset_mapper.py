@@ -1,0 +1,258 @@
+# ------------------------------------------------------------------------
+# Copyright (c) 2022 IDEA. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+# Modified from Mask2Former https://github.com/facebookresearch/Mask2Former by Feng Li.
+import copy
+import logging
+
+import numpy as np
+import torch
+from ..data_utils import annotations_to_instances, transform_instance_annotations, filter_empty_instances
+from detectron2.config import configurable
+from detectron2.data import detection_utils as utils
+from detectron2.data import transforms as T
+from detectron2.data.transforms import TransformGen
+from detectron2.structures import BitMasks, Instances, PolygonMasks
+import cv2
+from pycocotools import mask as coco_mask
+from torch.nn import functional as F
+
+__all__ = ["TrafficInstanceNewBaselineDatasetMapper"]
+
+
+def convert_coco_poly_to_mask(segmentations, height, width):
+    masks = []
+    for polygons in segmentations:
+        rles = coco_mask.frPyObjects(polygons, height, width)
+        mask = coco_mask.decode(rles)
+        if len(mask.shape) < 3:
+            mask = mask[..., None]
+        mask = torch.as_tensor(mask, dtype=torch.uint8)
+        mask = mask.any(dim=2)
+        masks.append(mask)
+    if masks:
+        masks = torch.stack(masks, dim=0)
+    else:
+        masks = torch.zeros((0, height, width), dtype=torch.uint8)
+    return masks
+
+
+def build_transform_gen(cfg, is_train):
+    """
+    Create a list of default :class:`Augmentation` from config.
+    Now it includes resizing and flipping.
+    Returns:
+        list[Augmentation]
+    """
+    assert is_train, "Only support training augmentation"
+    image_size = cfg.INPUT.IMAGE_SIZE
+    min_scale = cfg.INPUT.MIN_SCALE
+    max_scale = cfg.INPUT.MAX_SCALE
+
+    augmentation = []
+
+    if cfg.INPUT.RANDOM_FLIP != "none":
+        augmentation.append(
+            T.RandomFlip(
+                horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal",
+                vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
+            )
+        )
+
+    augmentation.extend([
+        T.ResizeScale(
+            min_scale=min_scale, max_scale=max_scale, target_height=image_size, target_width=image_size
+        ),
+        T.FixedSizeCrop(crop_size=(image_size, image_size)),
+    ])
+
+    return augmentation
+
+
+class TrafficInstanceNewBaselineDatasetMapper:
+    """
+    A callable which takes a dataset dict in Detectron2 Dataset format,
+    and map it into a format used by MaskFormer.
+
+    This dataset mapper applies the same transformation as DETR for COCO panoptic segmentation.
+
+    The callable currently does the following:
+
+    1. Read the image from "file_name"
+    2. Applies geometric transforms to the image and annotation
+    3. Find and applies suitable cropping to the image and annotation
+    4. Prepare image and annotation to Tensors
+    """
+
+    @configurable
+    def __init__(
+        self,
+        is_train=True,
+        *,
+        tfm_gens,
+        image_format,
+    ):
+        """
+        NOTE: this interface is experimental.
+        Args:
+            is_train: for training or inference
+            augmentations: a list of augmentations or deterministic transforms to apply
+            tfm_gens: data augmentation
+            image_format: an image format supported by :func:`detection_utils.read_image`.
+        """
+        self.tfm_gens = tfm_gens
+        logging.getLogger(__name__).info(
+            "[TrafficInstanceNewBaselineDatasetMapper] Full TransformGens used in training: {}".format(str(self.tfm_gens))
+        )
+
+        self.img_format = image_format
+        self.is_train = is_train
+    
+    @classmethod
+    def from_config(cls, cfg, is_train=True):
+        # Build augmentation
+        tfm_gens = build_transform_gen(cfg, is_train)
+
+        ret = {
+            "is_train": is_train,
+            "tfm_gens": tfm_gens,
+            "image_format": cfg.INPUT.FORMAT,
+        }
+        return ret
+
+    def __call__(self, dataset_dict):
+        """
+        Args:
+            dataset_dict (dict): Metadata of one image, in Detectron2 Dataset format.
+
+        Returns:
+            dict: a format that builtin models in detectron2 accept
+        """
+        dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
+        image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
+        utils.check_image_size(dataset_dict, image)
+        # import pdb; pdb.set_trace()
+        # TODO: get padding mask
+        # by feeding a "segmentation mask" to the same transforms
+        padding_mask = np.ones(image.shape[:2])
+
+        image, transforms = T.apply_transform_gens(self.tfm_gens, image)  #img transform
+        # the crop transformation has default padding value 0 for segmentation
+        padding_mask = transforms.apply_segmentation(padding_mask)
+        padding_mask = ~ padding_mask.astype(bool)
+
+        image_shape = image.shape[:2]  # h, w
+
+        # Pytorch's dataloader is efficient on torch.Tensor due to shared-memory,
+        # but not efficient on large generic data structures due to the use of pickle & mp.Queue.
+        # Therefore it's important to use torch.Tensor.
+        dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
+        dataset_dict["padding_mask"] = torch.as_tensor(np.ascontiguousarray(padding_mask))
+
+        if not self.is_train:
+            # USER: Modify this if you want to keep them for some reason.
+            dataset_dict.pop("annotations", None)
+            return dataset_dict
+
+        if "annotations" in dataset_dict:
+            # USER: Modify this if you want to keep them for some reason.
+            for anno in dataset_dict["annotations"]:
+                # Let's always keep mask
+                anno.pop("keypoints", None)
+            # import pdb; pdb.set_trace()
+            # load instance segmentation traffic
+            if "instance_mask_path" in dataset_dict:
+                instance_mask_path = dataset_dict["instance_mask_path"]
+                dataset_dict.pop("instance_mask_path", None)
+                obj_ids = dataset_dict["obj_ids"]
+                dataset_dict.pop("obj_ids", None)
+                gt_instance_masks = cv2.imread(instance_mask_path, cv2.IMREAD_GRAYSCALE)
+                gt_instance_masks = torch.tensor(gt_instance_masks, dtype=torch.uint8)#.cuda()  # h,w
+                # 先将h,w的mask送去做transform，之后再拆分
+                obj_ids = torch.tensor(obj_ids, dtype=torch.long)
+                max_obj_id = obj_ids.max()
+                binary_instance_mask = F.one_hot(gt_instance_masks.long(), num_classes=max_obj_id + 1).permute(2, 0, 1)  # max_obj_id+1, pad_H, pad_W
+                binary_instance_mask = binary_instance_mask[obj_ids.long(), :, :].to(torch.uint8)#.cpu() # num_obj, pad_H, pad_W
+                # import pdb; pdb.set_trace()
+                for idx, obj_ann in enumerate(dataset_dict["annotations"]):
+                    obj_ann["segmentation"] = binary_instance_mask[idx]
+                # dataset_dict["annotations"]["segmentation"] = binary_instance_mask
+
+            # USER: Implement additional transformations if you have other types of data
+            # annos = [
+            #     utils.transform_instance_annotations(obj, transforms, image_shape)
+            #     for obj in dataset_dict.pop("annotations")
+            #     if obj.get("iscrowd", 0) == 0
+            # ]
+            annos = [
+                transform_instance_annotations(obj, transforms, image_shape)
+                for obj in dataset_dict.pop("annotations")
+                if obj.get("iscrowd", 0) == 0
+            ]
+            # import pdb; pdb.set_trace()
+            #====绘图==
+            # COLOR = [(255, 127, 36), (255, 20, 147), (138, 43, 226), (72, 118, 255), (0, 139, 139)]
+            # cv_img = image.astype(np.uint8)[:, :, [2, 1, 0]]
+            # cv_img = cv2.cvtColor(np.asarray(cv_img), cv2.COLOR_BGR2RGB)
+            # w = cv_img.shape[1]
+            # h = cv_img.shape[0]
+            # cv_img_ori = cv_img.copy()
+            # cv_img_box = cv_img.copy()
+            # cv_img_msk = cv_img.copy()
+            # cv_img_all = cv_img.copy()
+            # for obj_an in annos:
+            #     #box
+            #     box = obj_an['bbox']
+            #     xmin = int(box[0] * 1)
+            #     ymin = int(box[1] * 1)
+            #     xmax = int(box[2] * 1)
+            #     ymax = int(box[3] * 1)
+            #     cv2.rectangle(cv_img_box, (xmin, ymin), (xmax, ymax), COLOR[1], 1)
+            #     cv2.rectangle(cv_img_all, (xmin, ymin), (xmax, ymax), COLOR[1], 1)
+            #     #mask
+            #     color_mask = np.random.randint(0, 256, (1, 3), dtype=np.uint8)
+            #     mask = obj_an['segmentation']
+            #     mask = np.array(mask, dtype=bool)
+            #     cv_img_msk[mask] = cv_img_msk[mask] * 0.5 +  color_mask * 0.5
+            #     cv_img_all[mask] = cv_img_all[mask] * 0.5 +  color_mask * 0.5
+            # cv2.putText(cv_img_ori, 'ori', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
+            # cv2.putText(cv_img_box, 'box', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
+            # cv2.putText(cv_img_msk, 'msk', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
+            # cv2.putText(cv_img_all, 'all', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
+            # cv_img1 = np.hstack((cv_img_ori, cv_img_box))
+            # cv_img2 = np.hstack((cv_img_msk, cv_img_all))
+            # cv_img3 = np.vstack((cv_img1, cv_img2))
+            # cv2.imwrite("00_result.jpg", cv_img3)
+            # import pdb; pdb.set_trace()
+            #=======
+
+            
+            # NOTE: does not support BitMask due to augmentation
+            # Current BitMask cannot handle empty objects
+            # instances = utils.annotations_to_instances(annos, image_shape)
+            instances = annotations_to_instances(annos, image_shape)  # 这个函数的功能就是套壳
+            # After transforms such as cropping are applied, the bounding box may no longer
+            # tightly bound the object. As an example, imagine a triangle object
+            # [(0,0), (2,0), (0,2)] cropped by a box [(1,0),(2,2)] (XYXY format). The tight
+            # bounding box of the cropped triangle should be [(1,0),(2,1)], which is not equal to
+            # the intersection of original bounding box and the cropping box.
+            if not instances.has('gt_masks'):  # this is to avoid empty annotation
+                instances.gt_masks = torch.tensor([])
+            # xyxy abs
+            # instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
+            # instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
+            # Need to filter empty instances first (due to augmentation)
+            # instances = utils.filter_empty_instances(instances)
+            instances = filter_empty_instances(instances)
+            # Generate masks from polygon
+            h, w = instances.image_size
+            # 将经过transform的mask转成tensor n_obj,w,h
+            if hasattr(instances, 'gt_masks') and hasattr(instances.gt_masks, 'polygons'):
+                gt_masks = instances.gt_masks
+                gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
+                instances.gt_masks = gt_masks
+
+            dataset_dict["instances"] = instances
+        # import pdb; pdb.set_trace()
+        return dataset_dict
