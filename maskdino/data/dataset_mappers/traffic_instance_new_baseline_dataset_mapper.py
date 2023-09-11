@@ -78,7 +78,7 @@ def check_image_size(dataset_dict, image):
         image_wh = (image.shape[1], image.shape[0])
         expected_wh = (dataset_dict["width"], dataset_dict["height"])
         if not image_wh == expected_wh:
-            print( "Mismatched image shape for image " + dataset_dict["file_name"] + " got " + image_wh + " expect " + expected_wh)
+            print( "Mismatched image shape for image " + dataset_dict["file_name"] + " got " + str(image_wh) + " expect " + str(expected_wh))
             dataset_dict["width"] = image.shape[1]
             dataset_dict["height"] = image.shape[0]
 
