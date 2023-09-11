@@ -51,6 +51,7 @@ from maskdino import (
     SemanticSegmentorWithTTA,
     add_maskdino_config,
     DetrDatasetMapper,
+    TrafficInstanceNewBaselineDatasetMapper,
 )
 import random
 from detectron2.engine import (
@@ -75,9 +76,13 @@ class Trainer(DefaultTrainer):
         logger = logging.getLogger("detectron2")
         if not logger.isEnabledFor(logging.INFO):  # setup_logger is not called for d2
             setup_logger()
+        
+        # 注释：这个函数就是自动识别设备的数量并配置work_size；同时会自动化调整学习率，batch等参数；warmup的参数等
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
 
         # Assume these objects must be constructed in this order.
+        # 基于cfg构造模型，优化器和数据加载器:
+        # 其中build_model调用了detectron2的注册机制。build_optimizer在下面实现了，主要包含关于优化器的初始化。build_train_loader也在下面实现了
         model = self.build_model(cfg)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
@@ -214,8 +219,11 @@ class Trainer(DefaultTrainer):
         elif cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_semantic":
             mapper = MaskFormerSemanticDatasetMapper(cfg, True)
             return build_detection_train_loader(cfg, mapper=mapper)
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "traffic_instance_lsj":
+            mapper = TrafficInstanceNewBaselineDatasetMapper(cfg, True)
+            return build_detection_train_loader(cfg, mapper=mapper)
         else:
-            mapper = None
+            mapper = None1
             return build_detection_train_loader(cfg, mapper=mapper)
 
     @classmethod
@@ -226,6 +234,7 @@ class Trainer(DefaultTrainer):
         """
         return build_lr_scheduler(cfg, optimizer)
 
+    # 关于优化器的初始化
     @classmethod
     def build_optimizer(cls, cfg, model):
         weight_decay_norm = cfg.SOLVER.WEIGHT_DECAY_NORM

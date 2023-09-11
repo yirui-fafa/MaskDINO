@@ -18,6 +18,7 @@ from .data.dataset_mappers.detr_dataset_mapper import DetrDatasetMapper
 from .data.dataset_mappers.mask_former_semantic_dataset_mapper import (
     MaskFormerSemanticDatasetMapper,
 )
+from .data.dataset_mappers.traffic_instance_new_baseline_dataset_mapper import TrafficInstanceNewBaselineDatasetMapper
 
 # models
 from .maskdino import MaskDINO
