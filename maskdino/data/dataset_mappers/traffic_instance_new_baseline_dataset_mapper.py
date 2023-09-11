@@ -70,6 +70,18 @@ def build_transform_gen(cfg, is_train):
     return augmentation
 
 
+def check_image_size(dataset_dict, image):
+    """
+    Raise an error if the image does not match the size specified in the dict.
+    """
+    if "width" in dataset_dict or "height" in dataset_dict:
+        image_wh = (image.shape[1], image.shape[0])
+        expected_wh = (dataset_dict["width"], dataset_dict["height"])
+        if not image_wh == expected_wh:
+            print( "Mismatched image shape for image " + dataset_dict["file_name"] + " got " + image_wh + " expect " + expected_wh)
+            dataset_dict["width"] = image.shape[1]
+            dataset_dict["height"] = image.shape[0]
+
 class TrafficInstanceNewBaselineDatasetMapper:
     """
     A callable which takes a dataset dict in Detectron2 Dataset format,
@@ -131,7 +143,15 @@ class TrafficInstanceNewBaselineDatasetMapper:
         """
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
         image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
-        utils.check_image_size(dataset_dict, image)
+        check_image_size(dataset_dict, image)
+        # convert to x,y,w,h abs
+        if "annotations" in dataset_dict:
+            width = dataset_dict["width"]
+            height = dataset_dict["height"]
+            for anno in dataset_dict["annotations"]:
+                box = copy.deepcopy(anno["bbox"])
+                anno["bbox"] = [(box[0]-box[2]/2)*width, (box[1]-box[3]/2)*height, box[2]*width, box[3]*height]
+                anno["bbox_mode"] = BoxMode.XYWH_ABS
         # import pdb; pdb.set_trace()
         # TODO: get padding mask
         # by feeding a "segmentation mask" to the same transforms
@@ -190,43 +210,6 @@ class TrafficInstanceNewBaselineDatasetMapper:
                 for obj in dataset_dict.pop("annotations")
                 if obj.get("iscrowd", 0) == 0
             ]
-            # import pdb; pdb.set_trace()
-            #====绘图==
-            # COLOR = [(255, 127, 36), (255, 20, 147), (138, 43, 226), (72, 118, 255), (0, 139, 139)]
-            # cv_img = image.astype(np.uint8)[:, :, [2, 1, 0]]
-            # cv_img = cv2.cvtColor(np.asarray(cv_img), cv2.COLOR_BGR2RGB)
-            # w = cv_img.shape[1]
-            # h = cv_img.shape[0]
-            # cv_img_ori = cv_img.copy()
-            # cv_img_box = cv_img.copy()
-            # cv_img_msk = cv_img.copy()
-            # cv_img_all = cv_img.copy()
-            # for obj_an in annos:
-            #     #box
-            #     box = obj_an['bbox']
-            #     xmin = int(box[0] * 1)
-            #     ymin = int(box[1] * 1)
-            #     xmax = int(box[2] * 1)
-            #     ymax = int(box[3] * 1)
-            #     cv2.rectangle(cv_img_box, (xmin, ymin), (xmax, ymax), COLOR[1], 1)
-            #     cv2.rectangle(cv_img_all, (xmin, ymin), (xmax, ymax), COLOR[1], 1)
-            #     #mask
-            #     color_mask = np.random.randint(0, 256, (1, 3), dtype=np.uint8)
-            #     mask = obj_an['segmentation']
-            #     mask = np.array(mask, dtype=bool)
-            #     cv_img_msk[mask] = cv_img_msk[mask] * 0.5 +  color_mask * 0.5
-            #     cv_img_all[mask] = cv_img_all[mask] * 0.5 +  color_mask * 0.5
-            # cv2.putText(cv_img_ori, 'ori', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
-            # cv2.putText(cv_img_box, 'box', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
-            # cv2.putText(cv_img_msk, 'msk', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
-            # cv2.putText(cv_img_all, 'all', (w-150, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,255), 1)
-            # cv_img1 = np.hstack((cv_img_ori, cv_img_box))
-            # cv_img2 = np.hstack((cv_img_msk, cv_img_all))
-            # cv_img3 = np.vstack((cv_img1, cv_img2))
-            # cv2.imwrite("00_result.jpg", cv_img3)
-            # import pdb; pdb.set_trace()
-            #=======
-
             
             # NOTE: does not support BitMask due to augmentation
             # Current BitMask cannot handle empty objects
